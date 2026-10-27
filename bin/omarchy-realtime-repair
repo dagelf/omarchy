@@ -1,0 +1,165 @@
+#!/bin/bash
+
+# omarchy:summary=Repair realtime budgets left at zero by a missing rtkit
+# omarchy:args=[budget-usec]
+# omarchy:hidden=true
+# omarchy:requires-sudo=true
+
+# Without rtkit, xdg-desktop-portal reports a realtime budget of 0, and
+# PipeWire's client module-rt applies it as a hard RLIMIT_RTTIME of 0. The
+# shell is such a client, so everything it launches inherits the zero. Once
+# rtkit is installed it accepts any hard limit at or below its own budget, 0
+# included, so a thread of such a process can be made realtime, and the kernel
+# then kills the process at its first RT watchdog check.
+#
+# With a budget given, only raise every hard zero to that budget: the
+# migration does this before rtkit is installed, when rtkit cannot be asked.
+# Without one, read rtkit's live budget, raise the zeros, restart each
+# logged-in user's portal that still reports a zero budget, and raise the
+# zeros that appeared meanwhile.
+#
+# Only processes of logged-in users are touched. Raising a hard limit needs
+# root, and this never prompts: without cached sudo it stops, and the caller
+# stays pending until a run that has it. Anything it cannot inspect is a
+# failure, never "nothing to do".
+
+proc_root=${OMARCHY_PROC_ROOT:-/proc}
+
+fail() {
+  echo "$1" >&2
+  exit 1
+}
+
+need_sudo() {
+  sudo -n true 2>/dev/null ||
+    fail "Repairing realtime budgets needs sudo without a prompt; the next omarchy update finishes it."
+}
+
+# Regular users only: root and system accounts can log in too, but their
+# processes are services, and a zero limit there may be deliberate.
+users=$(loginctl list-users --no-legend) || fail "Could not list the logged-in users"
+users=$(awk '$1 >= 1000' <<<"$users")
+uids=" $(awk '{ printf "%s ", $1 }' <<<"$users")"
+
+hard_rttime() {
+  awk '/^Max realtime timeout/ { print $5; found = 1 } END { exit !found }' "$1/limits" 2>/dev/null
+}
+
+# Field 22 of /proc/<pid>/stat, counted after the command name, which can
+# hold spaces, parentheses and newlines of its own.
+start_time() {
+  local stat fields
+
+  { stat=$(<"$1/stat"); } 2>/dev/null || return 1
+  read -ra fields <<<"${stat##*) }"
+  [[ -n ${fields[19]} ]] && echo "${fields[19]}"
+}
+
+# Lines of "pid starttime uid" for logged-in users' processes with a hard
+# zero. The start time is read before and after, so a PID reused meanwhile is
+# not mistaken for the process whose owner was read.
+scan_zero_rttime() {
+  local dir start uid hard again
+
+  for dir in "$proc_root"/[0-9]*; do
+    if ! start=$(start_time "$dir") ||
+      ! uid=$(awk '/^Uid:/ { print $2; found = 1 } END { exit !found }' "$dir/status" 2>/dev/null) ||
+      ! hard=$(hard_rttime "$dir") || ! again=$(start_time "$dir"); then
+      [[ -d $dir ]] && fail "Could not read the stat, status or limits of process ${dir##*/}"
+      continue
+    fi
+    [[ $uids == *" $uid "* && $hard == 0 && $again == "$start" ]] && echo "${dir##*/} $start $uid"
+  done
+  return 0
+}
+
+# The scan runs as root: with /proc mounted hidepid, a user cannot read other
+# users' processes, so their zeros would be missed (hidepid=2) or every run
+# would fail on them (hidepid=1). The UID filter still keeps it to logged-in
+# users.
+zero_rttime_processes() {
+  need_sudo
+  sudo -n env SCAN_ROOT="$proc_root" SCAN_UIDS="$uids" bash -c \
+    "$(declare -f fail start_time hard_rttime scan_zero_rttime)"'; proc_root=$SCAN_ROOT uids=$SCAN_UIDS scan_zero_rttime'
+}
+
+# Processes keep forking while a pass runs, so repeat until a pass finds no
+# zero. Each target is checked again just before prlimit: the same process
+# (start time and owner unchanged) still at a hard zero, so neither a reused
+# PID nor a limit someone else has just set is overwritten.
+raise_zero_budgets() {
+  local budget=$1 targets
+
+  for _ in {1..10}; do
+    targets=$(zero_rttime_processes) || exit 1
+    [[ -z $targets ]] && return 0
+
+    need_sudo
+    sudo -n env PROC_ROOT="$proc_root" BUDGET="$budget" bash -c "$(declare -f start_time)"'
+      while read -r pid start uid; do
+        dir=$PROC_ROOT/$pid
+        [[ $(start_time "$dir") == "$start" ]] || continue
+        [[ $(awk "/^Uid:/ { print \$2 }" "$dir/status" 2>/dev/null) == "$uid" ]] || continue
+        [[ $(awk "/^Max realtime timeout/ { print \$5 }" "$dir/limits" 2>/dev/null) == 0 ]] || continue
+        prlimit --pid "$pid" --rttime="$BUDGET:$BUDGET" || [[ ! -d $dir ]] || exit 1
+      done' <<<"$targets" || fail "Could not raise the realtime budget of every process"
+  done
+
+  fail "Processes still start with a zero realtime budget: $(zero_rttime_processes | awk '{ printf "%s ", $1 }')"
+}
+
+as_user() {
+  local user=$1 command=$2
+  shift 2
+
+  if [[ $user == "$(id -un)" ]]; then
+    "$command" --user "$@"
+  else
+    need_sudo
+    sudo -n "$command" --user --machine="$user@" "$@"
+  fi
+}
+
+portal_budget() {
+  as_user "$1" busctl get-property org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop \
+    org.freedesktop.portal.Realtime RTTimeUSecMax 2>/dev/null | awk '{ print $2 }'
+}
+
+# The portal reads rtkit's budget once, when it starts, so one started before
+# rtkit was installed keeps reporting zero. One that is not running reads it
+# when it next starts. A portal that already reports a budget is left alone.
+repair_portals() {
+  local user state
+
+  while read -r _ user _; do
+    state=$(as_user "$user" systemctl show -p ActiveState --value xdg-desktop-portal.service) ||
+      fail "Could not read the state of $user's portal"
+
+    case $state in
+      inactive | failed) continue ;;
+      active) ;;
+      *) fail "$user's portal is $state; the next run repairs it" ;;
+    esac
+
+    [[ $(portal_budget "$user") =~ ^[1-9][0-9]*$ ]] && continue
+
+    # A failed restart leaves the zero in place, which the check below catches.
+    as_user "$user" systemctl restart xdg-desktop-portal.service
+    [[ $(portal_budget "$user") =~ ^[1-9][0-9]*$ ]] ||
+      fail "$user's portal still reports a zero realtime budget"
+  done <<<"$users"
+}
+
+if [[ -n ${1:-} ]]; then
+  [[ $1 =~ ^[1-9][0-9]*$ ]] || fail "The budget must be a positive number of microseconds"
+  raise_zero_budgets "$1"
+  exit 0
+fi
+
+budget=$(busctl get-property org.freedesktop.RealtimeKit1 /org/freedesktop/RealtimeKit1 \
+  org.freedesktop.RealtimeKit1 RTTimeUSecMax 2>/dev/null | awk '{ print $2 }')
+[[ $budget =~ ^[1-9][0-9]*$ ]] || fail "rtkit reports no realtime budget"
+
+raise_zero_budgets "$budget"
+repair_portals
+raise_zero_budgets "$budget"
